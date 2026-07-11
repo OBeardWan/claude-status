@@ -15,8 +15,9 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
+gi.require_version("Notify", "0.7")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator3
-from gi.repository import GLib, Gtk
+from gi.repository import GLib, Gtk, Notify
 
 STATUS_URL = "https://status.claude.com/api/v2/status.json"
 COMPONENTS_URL = "https://status.claude.com/api/v2/components.json"
@@ -53,6 +54,28 @@ COLORS = {
     "critical": (0.90, 0.15, 0.15),  # critical - red
     "unknown": (0.55, 0.55, 0.55),   # unreachable - gray
 }
+
+# Desktop notifications fire on the "operational" <-> "not operational" boundary
+# (in either direction), not on every severity change, mirroring the macOS
+# app's green/orange/red popup behavior.
+NOTIFY_ICON = {
+    "none": "dialog-information",
+    "minor": "dialog-warning",
+    "major": "dialog-warning",
+    "critical": "dialog-error",
+    "unknown": "dialog-warning",
+}
+
+
+def notify(summary, body, indicator):
+    try:
+        n = Notify.Notification.new(summary, body, NOTIFY_ICON.get(indicator, "dialog-information"))
+        n.set_urgency(
+            Notify.Urgency.CRITICAL if indicator in ("major", "critical") else Notify.Urgency.NORMAL
+        )
+        n.show()
+    except Exception:
+        pass  # notification daemon unavailable -- non-critical, don't crash the poll loop
 
 
 def load_history():
@@ -143,7 +166,11 @@ def cleanup_old_icons(keep_names):
 
 class ClaudeStatusIndicator:
     def __init__(self):
+        Notify.init("Claude Status")
         self.history = load_history()
+        last = self.history[-1] if self.history else None
+        self.last_indicator = last.get("indicator") if last else None
+        self.last_api_indicator = last.get("api_indicator") if last else None
         self.icon_name = f"{ICON_NAME_PREFIX}{int(time.time() * 1000)}"
         write_icon(self.history, self.icon_name)
         cleanup_old_icons([self.icon_name])
@@ -218,6 +245,19 @@ class ClaudeStatusIndicator:
         api_name = api_indicator if api_indicator in COLORS else "unknown"
         self.status_item.set_label(description)
         self.api_status_item.set_label(api_description)
+
+        if self.last_indicator is not None and name != self.last_indicator:
+            if self.last_indicator == "none":
+                notify("Claude Status: Degraded", description, name)
+            elif name == "none":
+                notify("Claude Status: Back to Normal", description, name)
+        if self.last_api_indicator is not None and api_name != self.last_api_indicator:
+            if self.last_api_indicator == "none":
+                notify("Claude API: Degraded", api_description, api_name)
+            elif api_name == "none":
+                notify("Claude API: Back to Normal", api_description, api_name)
+        self.last_indicator = name
+        self.last_api_indicator = api_name
 
         self.history.append({
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),

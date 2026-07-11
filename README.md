@@ -10,6 +10,9 @@ dropdown needed to see recent uptime at a glance.
   disk so it survives restarts
 - Dropdown menu still shows current status text, a manual refresh, and a link
   to the status page
+- Desktop notification when either row crosses the operational/degraded
+  boundary in either direction (goes from green to yellow/orange/red, or
+  recovers back to green)
 
 This was built as a Linux/KDE equivalent to a macOS-only menu bar app of the
 same idea, since no Linux port existed.
