@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Tray icon showing a live mini history bar of Claude service health."""
+import datetime
+import fcntl
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+import webbrowser
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+from gi.repository import GLib, Gtk
+
+STATUS_URL = "https://status.claude.com/api/v2/status.json"
+COMPONENTS_URL = "https://status.claude.com/api/v2/components.json"
+CLAUDE_API_COMPONENT_ID = "k8w3r06qmzrp"  # "Claude API (api.anthropic.com)" -- what Opus actually runs on; there's no Opus-specific status feed
+STATUS_PAGE = "https://status.claude.com"
+POLL_SECONDS = 60
+
+COMPONENT_STATUS_MAP = {
+    "operational": "none",
+    "degraded_performance": "minor",
+    "partial_outage": "major",
+    "major_outage": "critical",
+    "under_maintenance": "minor",
+}
+
+HISTORY_PATH = os.path.expanduser("~/.local/share/claude-status/history.json")
+HISTORY_MAX_STORED = 2000  # ~33h of polls at 60s cadence
+ICON_BAR_COUNT = 10  # segments drawn inside the tray icon itself (~10min at 60s cadence)
+
+# Installed into the user's real hicolor icon theme (~/.local/share/icons/hicolor)
+# instead of an app-private IconThemePath dir: Plasma's SNI icon resolver
+# unreliably honors the per-item IconThemePath D-Bus property, but hicolor is
+# always searched by both KDE and GTK. Every poll gets a brand-new, never-reused
+# icon name (a fixed pool of alternating names got stuck showing a stale cached
+# render, since Plasma's QIcon cache is keyed by name only and never rechecks
+# the file on disk once it has resolved that name before).
+HICOLOR_DIR = os.path.expanduser("~/.local/share/icons/hicolor")
+SIZES = tuple(range(12, 65))  # dense so Plasma always finds an exact match instead of smooth-scaling (blurring) a mismatched size
+ICON_NAME_PREFIX = "claude-status-live-"
+COLORS = {
+    "none": (0.20, 0.75, 0.35),      # operational - green
+    "minor": (0.95, 0.75, 0.10),     # minor - yellow
+    "major": (0.95, 0.50, 0.10),     # major - orange
+    "critical": (0.90, 0.15, 0.15),  # critical - red
+    "unknown": (0.55, 0.55, 0.55),   # unreachable - gray
+}
+
+
+def load_history():
+    try:
+        with open(HISTORY_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_history(history):
+    os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+    tmp_path = HISTORY_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(history, f)
+    os.replace(tmp_path, HISTORY_PATH)
+
+
+WIDTH_SCALE = 1.5  # tray icons are wider than tall so segments aren't cramped
+
+
+def render_row(ctx, history, field, bar_px, gap_px, y0, y1):
+    recent = history[-ICON_BAR_COUNT:]
+    padded = [None] * (ICON_BAR_COUNT - len(recent)) + recent
+    for i, entry in enumerate(padded):
+        x0 = i * (bar_px + gap_px)
+        x1 = x0 + bar_px
+        value = entry.get(field) if entry else None
+        if value is None:
+            ctx.set_source_rgba(0.5, 0.5, 0.5, 0.35)
+        else:
+            r, g, b = COLORS.get(value, COLORS["unknown"])
+            ctx.set_source_rgb(r, g, b)
+        ctx.rectangle(x0, y0, x1 - x0, y1 - y0)
+        ctx.fill()
+
+
+def render_icon(history, size):
+    import cairo
+
+    height = size
+    target_width = size * WIDTH_SCALE
+    gap_px = 1
+    # Derive a fixed per-bar pixel width from the target total width, rather
+    # than dividing the total by ICON_BAR_COUNT per-bar (which leaves rounding
+    # remainders and makes some bars 1px wider than others).
+    bar_px = max(1, round((target_width - (ICON_BAR_COUNT - 1) * gap_px) / ICON_BAR_COUNT))
+    width = ICON_BAR_COUNT * bar_px + (ICON_BAR_COUNT - 1) * gap_px
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    ctx = cairo.Context(surface)
+    ctx.set_antialias(cairo.ANTIALIAS_NONE)
+    ctx.set_source_rgba(0, 0, 0, 0)
+    ctx.paint()
+
+    row_gap = max(2, round(height / 8))
+    if (height - row_gap) % 2 != 0:
+        row_gap += 1  # keep top/bottom rows exactly equal height rather than off by 1px
+    top_h = (height - row_gap) // 2
+    render_row(ctx, history, "indicator", bar_px, gap_px, 0, top_h)
+    render_row(ctx, history, "api_indicator", bar_px, gap_px, top_h + row_gap, height)
+
+    return surface
+
+
+def write_icon(history, name):
+    for size in SIZES:
+        app_dir = os.path.join(HICOLOR_DIR, f"{size}x{size}", "apps")
+        os.makedirs(app_dir, exist_ok=True)
+        surface = render_icon(history, size)
+        surface.write_to_png(os.path.join(app_dir, f"{name}.png"))
+    subprocess.run(
+        ["gtk-update-icon-cache", "-f", "-t", HICOLOR_DIR],
+        capture_output=True,
+        check=False,
+    )
+
+
+def cleanup_old_icons(keep_names):
+    keep = set(keep_names)
+    for size in SIZES:
+        app_dir = os.path.join(HICOLOR_DIR, f"{size}x{size}", "apps")
+        for path in glob.glob(os.path.join(app_dir, f"{ICON_NAME_PREFIX}*.png")):
+            name = os.path.splitext(os.path.basename(path))[0]
+            if name not in keep:
+                os.remove(path)
+
+
+class ClaudeStatusIndicator:
+    def __init__(self):
+        self.history = load_history()
+        self.icon_name = f"{ICON_NAME_PREFIX}{int(time.time() * 1000)}"
+        write_icon(self.history, self.icon_name)
+        cleanup_old_icons([self.icon_name])
+
+        self.indicator = AppIndicator3.Indicator.new(
+            "claude-status",
+            self.icon_name,
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("Claude Status")
+
+        self.menu = Gtk.Menu()
+
+        self.status_item = Gtk.MenuItem(label="Checking...")
+        self.status_item.set_sensitive(False)
+        self.menu.append(self.status_item)
+
+        self.api_status_item = Gtk.MenuItem(label="Checking...")
+        self.api_status_item.set_sensitive(False)
+        self.menu.append(self.api_status_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        refresh_item = Gtk.MenuItem(label="Refresh Now")
+        refresh_item.connect("activate", lambda _: self.poll())
+        self.menu.append(refresh_item)
+
+        open_item = Gtk.MenuItem(label="Open Status Page")
+        open_item.connect("activate", lambda _: webbrowser.open(STATUS_PAGE))
+        self.menu.append(open_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda _: Gtk.main_quit())
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+        self.poll()
+        GLib.timeout_add_seconds(POLL_SECONDS, self._poll_cb)
+
+    def _poll_cb(self):
+        self.poll()
+        return True
+
+    def poll(self):
+        try:
+            with urllib.request.urlopen(STATUS_URL, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            indicator = data["status"]["indicator"]
+            description = data["status"]["description"]
+        except Exception as exc:
+            indicator = "unknown"
+            description = f"Unable to reach status page ({exc})"
+
+        try:
+            with urllib.request.urlopen(COMPONENTS_URL, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            component = next(
+                c for c in data["components"] if c["id"] == CLAUDE_API_COMPONENT_ID
+            )
+            api_indicator = COMPONENT_STATUS_MAP.get(component["status"], "unknown")
+            api_description = f"{component['name']}: {component['status'].replace('_', ' ').title()}"
+        except Exception as exc:
+            api_indicator = "unknown"
+            api_description = f"Claude API: unavailable ({exc})"
+
+        name = indicator if indicator in COLORS else "unknown"
+        api_name = api_indicator if api_indicator in COLORS else "unknown"
+        self.status_item.set_label(description)
+        self.api_status_item.set_label(api_description)
+
+        self.history.append({
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "indicator": name,
+            "api_indicator": api_name,
+        })
+        self.history = self.history[-HISTORY_MAX_STORED:]
+        save_history(self.history)
+
+        previous_icon_name = self.icon_name
+        self.icon_name = f"{ICON_NAME_PREFIX}{int(time.time() * 1000)}"
+        write_icon(self.history, self.icon_name)
+        self.indicator.set_icon_full(self.icon_name, f"{description} | {api_description}")
+        cleanup_old_icons([self.icon_name, previous_icon_name])
+
+
+LOCK_PATH = os.path.expanduser("~/.local/share/claude-status/claude-status.lock")
+
+
+def acquire_single_instance_lock():
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    lock_file = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return lock_file  # keep a reference alive for the process lifetime; released on exit
+
+
+def main():
+    lock_file = acquire_single_instance_lock()
+    if lock_file is None:
+        print("claude-status is already running; exiting.", file=sys.stderr)
+        sys.exit(0)
+
+    ClaudeStatusIndicator()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

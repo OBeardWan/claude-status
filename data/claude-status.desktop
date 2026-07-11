@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Status
+Comment=Tray app monitoring Claude service health
+Exec=/usr/bin/claude-status
+Icon=claude-status
+Terminal=false
+Categories=Utility;Monitor;
+NoDisplay=false
