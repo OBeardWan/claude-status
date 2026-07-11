@@ -16,12 +16,15 @@ same idea, since no Linux port existed.
 
 ## Install (Arch / EndeavourOS / Manjaro)
 
+Not yet on the AUR — build it from this repo's `PKGBUILD` directly:
+
 ```
-yay -S claude-status
+git clone https://github.com/OBeardWan/claude-status.git
+cd claude-status
+makepkg -si
 ```
 
-(or your AUR helper of choice). This installs the binary, a `.desktop` entry
-for your app launcher, and icons.
+This installs the binary, a `.desktop` entry for your app launcher, and icons.
 
 After installing, launch "Claude Status" from your application launcher once.
 To have it start automatically on login, add it via your desktop's autostart
@@ -35,8 +38,8 @@ Claude Status**) — the package intentionally doesn't force autostart on you.
 - **GNOME Shell**: GNOME removed the system tray by default. You'll need the
   [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
   extension installed first, or the icon simply won't appear.
-- Depends on `libayatana-appindicator`, GTK3, and PyGObject — these are all
-  declared as package dependencies and pulled in automatically via the AUR.
+- Depends on `libayatana-appindicator`, GTK3, and PyGObject — declared as
+  package dependencies in `PKGBUILD` and pulled in automatically by `makepkg -si`.
 
 ## Manual install (other distros)
 
@@ -55,18 +58,13 @@ There's no distro-agnostic package yet. To run it manually:
 
 ## Publishing checklist (maintainer notes)
 
-Before this is usable by anyone else:
+Currently released via GitHub only (tagged releases + `PKGBUILD`), no AUR
+submission planned for now. If that changes later:
 
-1. Push this repo to GitHub and update the `url=` placeholder in `PKGBUILD`.
-2. Tag a release (`git tag v1.0.0 && git push --tags`) so the PKGBUILD's
-   source URL resolves.
-3. Run `updpkgsums` in this directory to replace the `SKIP` checksum with a
-   real one.
-4. Test the build locally with `makepkg -si`.
-5. Create the AUR package: clone
-   `ssh://aur@aur.archlinux.org/claude-status.git`, copy in `PKGBUILD` (AUR
-   also wants a generated `.SRCINFO` via `makepkg --printsrcinfo > .SRCINFO`),
-   commit, and push. Requires an AUR account and an SSH key registered with it.
+1. Create an AUR account and register an SSH key with it.
+2. Clone `ssh://aur@aur.archlinux.org/claude-status.git`, copy in `PKGBUILD`
+   (AUR also wants a generated `.SRCINFO` via
+   `makepkg --printsrcinfo > .SRCINFO`), commit, and push.
 
 ## License
 
