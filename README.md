@@ -14,6 +14,12 @@ dropdown needed to see recent uptime at a glance.
 This was built as a Linux/KDE equivalent to a macOS-only menu bar app of the
 same idea, since no Linux port existed.
 
+![Tray icon showing two rows of green history segments](docs/tray-icon.png)
+
+*All-green here means both the overall status and the Claude API component
+have been fully operational across the last 10 polls; segments shift to
+yellow/orange/red as degradations show up in the history.*
+
 ## Install (Arch / EndeavourOS / Manjaro)
 
 Not yet on the AUR — build it from this repo's `PKGBUILD` directly:
