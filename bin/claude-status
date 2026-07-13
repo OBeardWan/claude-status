@@ -21,6 +21,7 @@ from gi.repository import GLib, Gtk, Notify
 
 STATUS_URL = "https://status.claude.com/api/v2/status.json"
 COMPONENTS_URL = "https://status.claude.com/api/v2/components.json"
+INCIDENTS_URL = "https://status.claude.com/api/v2/incidents/unresolved.json"
 CLAUDE_API_COMPONENT_ID = "k8w3r06qmzrp"  # "Claude API (api.anthropic.com)" -- what Opus actually runs on; there's no Opus-specific status feed
 STATUS_PAGE = "https://status.claude.com"
 POLL_SECONDS = 60
@@ -76,6 +77,58 @@ def notify(summary, body, indicator):
         n.show()
     except Exception:
         pass  # notification daemon unavailable -- non-critical, don't crash the poll loop
+
+
+def fetch_incidents():
+    try:
+        with urllib.request.urlopen(INCIDENTS_URL, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        return data.get("incidents", [])
+    except Exception:
+        return []
+
+
+def incident_detail(incidents, component_id=None):
+    """Return the first unresolved incident affecting component_id (or any
+    incident if component_id is None), so the UI can show what's actually
+    broken instead of just a severity label."""
+    for inc in incidents:
+        if component_id is not None:
+            comp_ids = {c["id"] for c in inc.get("components", [])}
+            if component_id not in comp_ids:
+                continue
+        updates = inc.get("incident_updates") or []
+        latest = max(updates, key=lambda u: u.get("created_at", "")) if updates else None
+        return {
+            "name": inc.get("name"),
+            "status": inc.get("status"),
+            "started_at": inc.get("started_at"),
+            "shortlink": inc.get("shortlink"),
+            "body": latest.get("body") if latest else None,
+        }
+    return None
+
+
+def relative_time(iso_str):
+    if not iso_str:
+        return "unknown"
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError:
+        return "unknown"
+    secs = int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def indicator_hex(indicator):
+    r, g, b = COLORS.get(indicator, COLORS["unknown"])
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
 
 def load_history():
@@ -185,13 +238,30 @@ class ClaudeStatusIndicator:
 
         self.menu = Gtk.Menu()
 
-        self.status_item = Gtk.MenuItem(label="Checking...")
+        self.status_label = Gtk.Label(label="Checking...")
+        self.status_label.set_xalign(0)
+        self.status_item = Gtk.MenuItem()
+        self.status_item.add(self.status_label)
         self.status_item.set_sensitive(False)
         self.menu.append(self.status_item)
 
-        self.api_status_item = Gtk.MenuItem(label="Checking...")
+        self.api_status_label = Gtk.Label(label="Checking...")
+        self.api_status_label.set_xalign(0)
+        self.api_status_item = Gtk.MenuItem()
+        self.api_status_item.add(self.api_status_label)
         self.api_status_item.set_sensitive(False)
         self.menu.append(self.api_status_item)
+
+        self.issue_label = Gtk.Label()
+        self.issue_label.set_xalign(0)
+        self.issue_label.set_line_wrap(True)
+        self.issue_label.set_max_width_chars(40)
+        self.issue_item = Gtk.MenuItem()
+        self.issue_item.add(self.issue_label)
+        self.issue_item.set_no_show_all(True)  # only shown while an issue is active; menu.show_all() below must skip it
+        self.issue_shortlink = None
+        self.issue_item.connect("activate", lambda _: self.issue_shortlink and webbrowser.open(self.issue_shortlink))
+        self.menu.append(self.issue_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -236,24 +306,77 @@ class ClaudeStatusIndicator:
                 c for c in data["components"] if c["id"] == CLAUDE_API_COMPONENT_ID
             )
             api_indicator = COMPONENT_STATUS_MAP.get(component["status"], "unknown")
-            api_description = f"{component['name']}: {component['status'].replace('_', ' ').title()}"
+            api_status_word = component["status"].replace("_", " ").title()
+            api_description = f"{component['name']}: {api_status_word}"
         except Exception as exc:
             api_indicator = "unknown"
+            api_status_word = "Unavailable"
             api_description = f"Claude API: unavailable ({exc})"
 
         name = indicator if indicator in COLORS else "unknown"
         api_name = api_indicator if api_indicator in COLORS else "unknown"
-        self.status_item.set_label(description)
-        self.api_status_item.set_label(api_description)
+
+        def set_status_row(label, prefix, status_word, sev):
+            hex_color = indicator_hex(sev)
+            label.set_markup(
+                f"{GLib.markup_escape_text(prefix)}    "
+                f'<span foreground="{hex_color}">● {GLib.markup_escape_text(status_word)}</span>'
+            )
+
+        set_status_row(self.status_label, "Overall", description, name)
+        set_status_row(self.api_status_label, "Claude API", api_status_word, api_name)
+
+        # Fetch what's actually broken (mirrors the macOS app's click-through
+        # incident detail) only when something is degraded -- no point paying
+        # for a second request while everything's operational.
+        incidents = fetch_incidents() if (name != "none" or api_name != "none") else []
+        overall = incident_detail(incidents) if name != "none" else None
+        api_detail = incident_detail(incidents, component_id=CLAUDE_API_COMPONENT_ID) if api_name != "none" else None
+
+        # Surface whichever of the two indicators is currently worse as a single
+        # colored card, so its color matches the more severe of the two rows.
+        SEVERITY_RANK = {"none": 0, "minor": 1, "major": 2, "critical": 3, "unknown": 4}
+        if SEVERITY_RANK.get(api_name, 4) >= SEVERITY_RANK.get(name, 4):
+            issue_indicator, issue_detail, issue_fallback = api_name, api_detail, api_description
+        else:
+            issue_indicator, issue_detail, issue_fallback = name, overall, description
+
+        if issue_indicator == "none":
+            self.issue_item.hide()
+            self.issue_shortlink = None
+        else:
+            hex_color = indicator_hex(issue_indicator)
+            if issue_detail:
+                title = issue_detail["name"]
+                status_word = (issue_detail["status"] or "").replace("_", " ").title()
+                started = relative_time(issue_detail["started_at"])
+                subtitle = f"{status_word} · Started {started}" if status_word else f"Started {started}"
+                self.issue_shortlink = issue_detail["shortlink"]
+            else:
+                title = issue_fallback
+                subtitle = None
+                self.issue_shortlink = None
+            markup = f'<b><span foreground="{hex_color}">{GLib.markup_escape_text(title)}</span></b>'
+            if subtitle:
+                markup += f'\n<span size="small" foreground="#9aa0a6">{GLib.markup_escape_text(subtitle)}</span>'
+            self.issue_label.set_markup(markup)
+            self.issue_item.set_sensitive(bool(self.issue_shortlink))
+            self.issue_item.show()
+            self.issue_label.show()
+
+        def notify_body(base_description, detail):
+            if not detail:
+                return base_description
+            return f"{detail['name']}\n{detail['body']}" if detail["body"] else detail["name"]
 
         if self.last_indicator is not None and name != self.last_indicator:
             if self.last_indicator == "none":
-                notify("Claude Status: Degraded", description, name)
+                notify("Claude Status: Degraded", notify_body(description, overall), name)
             elif name == "none":
                 notify("Claude Status: Back to Normal", description, name)
         if self.last_api_indicator is not None and api_name != self.last_api_indicator:
             if self.last_api_indicator == "none":
-                notify("Claude API: Degraded", api_description, api_name)
+                notify("Claude API: Degraded", notify_body(api_description, api_detail), api_name)
             elif api_name == "none":
                 notify("Claude API: Back to Normal", api_description, api_name)
         self.last_indicator = name
