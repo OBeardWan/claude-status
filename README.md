@@ -13,6 +13,9 @@ dropdown needed to see recent uptime at a glance.
 - Desktop notification when either row crosses the operational/degraded
   boundary in either direction (goes from green to yellow/orange/red, or
   recovers back to green)
+- When something's degraded, the dropdown shows a colored line naming the
+  active incident (status, how long ago it started) — click it to open the
+  incident on the status page
 
 This was built as a Linux/KDE equivalent to a macOS-only menu bar app of the
 same idea, since no Linux port existed.
