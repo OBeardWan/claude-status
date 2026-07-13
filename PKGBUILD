@@ -8,7 +8,7 @@ url="https://github.com/OBeardWan/claude-status"
 license=('MIT')
 depends=('python' 'python-gobject' 'gtk3' 'libayatana-appindicator' 'python-cairo' 'libnotify')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('ef3e59bd1d32743be4fe96351a362f9a238cfea53c497ae6c8f14c6d3ef26191')
 
 package() {
   cd "$pkgname-$pkgver"
