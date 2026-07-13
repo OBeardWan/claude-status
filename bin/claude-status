@@ -17,7 +17,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("Notify", "0.7")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator3
-from gi.repository import GLib, Gtk, Notify
+from gi.repository import Gdk, GLib, Gtk, Notify
 
 STATUS_URL = "https://status.claude.com/api/v2/status.json"
 COMPONENTS_URL = "https://status.claude.com/api/v2/components.json"
@@ -126,9 +126,31 @@ def relative_time(iso_str):
     return f"{secs // 86400}d ago"
 
 
-def indicator_hex(indicator):
+_DOT_PIXBUF_CACHE = {}
+DOT_SIZE = 12
+
+
+def dot_pixbuf(indicator):
+    # System tray menus (AppIndicator/dbusmenu) are rendered by the shell
+    # over D-Bus, which only carries a plain label string -- Pango markup
+    # like <span foreground="..."> gets silently stripped. A per-item icon
+    # is the one thing that protocol *does* carry, so severity color has to
+    # be conveyed as a small rendered dot rather than colored text.
+    if indicator in _DOT_PIXBUF_CACHE:
+        return _DOT_PIXBUF_CACHE[indicator]
+    import cairo
+
     r, g, b = COLORS.get(indicator, COLORS["unknown"])
-    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, DOT_SIZE, DOT_SIZE)
+    ctx = cairo.Context(surface)
+    ctx.set_source_rgba(0, 0, 0, 0)
+    ctx.paint()
+    ctx.set_source_rgb(r, g, b)
+    ctx.arc(DOT_SIZE / 2, DOT_SIZE / 2, DOT_SIZE / 2 - 1, 0, 2 * 3.141592653589793)
+    ctx.fill()
+    pixbuf = Gdk.pixbuf_get_from_surface(surface, 0, 0, DOT_SIZE, DOT_SIZE)
+    _DOT_PIXBUF_CACHE[indicator] = pixbuf
+    return pixbuf
 
 
 def load_history():
@@ -238,30 +260,29 @@ class ClaudeStatusIndicator:
 
         self.menu = Gtk.Menu()
 
-        self.status_label = Gtk.Label(label="Checking...")
-        self.status_label.set_xalign(0)
-        self.status_item = Gtk.MenuItem()
-        self.status_item.add(self.status_label)
-        self.status_item.set_sensitive(False)
+        # ImageMenuItem, not plain MenuItem: severity color has to travel as a
+        # per-item icon (see dot_pixbuf) since the dbusmenu protocol used by
+        # AppIndicator/Plasma strips Pango markup from labels, and insensitive
+        # items get forced to the theme's disabled-gray regardless of markup.
+        self.status_item = Gtk.ImageMenuItem(label="Checking...")
+        self.status_item.set_always_show_image(True)
         self.menu.append(self.status_item)
 
-        self.api_status_label = Gtk.Label(label="Checking...")
-        self.api_status_label.set_xalign(0)
-        self.api_status_item = Gtk.MenuItem()
-        self.api_status_item.add(self.api_status_label)
-        self.api_status_item.set_sensitive(False)
+        self.api_status_item = Gtk.ImageMenuItem(label="Checking...")
+        self.api_status_item.set_always_show_image(True)
         self.menu.append(self.api_status_item)
 
-        self.issue_label = Gtk.Label()
-        self.issue_label.set_xalign(0)
-        self.issue_label.set_line_wrap(True)
-        self.issue_label.set_max_width_chars(40)
-        self.issue_item = Gtk.MenuItem()
-        self.issue_item.add(self.issue_label)
+        self.issue_item = Gtk.ImageMenuItem()
+        self.issue_item.set_always_show_image(True)
         self.issue_item.set_no_show_all(True)  # only shown while an issue is active; menu.show_all() below must skip it
         self.issue_shortlink = None
         self.issue_item.connect("activate", lambda _: self.issue_shortlink and webbrowser.open(self.issue_shortlink))
         self.menu.append(self.issue_item)
+
+        self.issue_subtitle_item = Gtk.MenuItem()
+        self.issue_subtitle_item.set_sensitive(False)  # deliberately grayed -- doubles as the dim "subtitle" styling
+        self.issue_subtitle_item.set_no_show_all(True)
+        self.menu.append(self.issue_subtitle_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -316,15 +337,12 @@ class ClaudeStatusIndicator:
         name = indicator if indicator in COLORS else "unknown"
         api_name = api_indicator if api_indicator in COLORS else "unknown"
 
-        def set_status_row(label, prefix, status_word, sev):
-            hex_color = indicator_hex(sev)
-            label.set_markup(
-                f"{GLib.markup_escape_text(prefix)}    "
-                f'<span foreground="{hex_color}">● {GLib.markup_escape_text(status_word)}</span>'
-            )
+        def set_status_row(item, prefix, status_word, sev):
+            item.set_label(f"{prefix}    {status_word}")
+            item.set_image(Gtk.Image.new_from_pixbuf(dot_pixbuf(sev)))
 
-        set_status_row(self.status_label, "Overall", description, name)
-        set_status_row(self.api_status_label, "Claude API", api_status_word, api_name)
+        set_status_row(self.status_item, "Overall", description, name)
+        set_status_row(self.api_status_item, "Claude API", api_status_word, api_name)
 
         # Fetch what's actually broken (mirrors the macOS app's click-through
         # incident detail) only when something is degraded -- no point paying
@@ -343,9 +361,9 @@ class ClaudeStatusIndicator:
 
         if issue_indicator == "none":
             self.issue_item.hide()
+            self.issue_subtitle_item.hide()
             self.issue_shortlink = None
         else:
-            hex_color = indicator_hex(issue_indicator)
             if issue_detail:
                 title = issue_detail["name"]
                 status_word = (issue_detail["status"] or "").replace("_", " ").title()
@@ -356,13 +374,15 @@ class ClaudeStatusIndicator:
                 title = issue_fallback
                 subtitle = None
                 self.issue_shortlink = None
-            markup = f'<b><span foreground="{hex_color}">{GLib.markup_escape_text(title)}</span></b>'
-            if subtitle:
-                markup += f'\n<span size="small" foreground="#9aa0a6">{GLib.markup_escape_text(subtitle)}</span>'
-            self.issue_label.set_markup(markup)
+            self.issue_item.set_label(title)
+            self.issue_item.set_image(Gtk.Image.new_from_pixbuf(dot_pixbuf(issue_indicator)))
             self.issue_item.set_sensitive(bool(self.issue_shortlink))
             self.issue_item.show()
-            self.issue_label.show()
+            if subtitle:
+                self.issue_subtitle_item.set_label(subtitle)
+                self.issue_subtitle_item.show()
+            else:
+                self.issue_subtitle_item.hide()
 
         def notify_body(base_description, detail):
             if not detail:
