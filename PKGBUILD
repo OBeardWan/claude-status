@@ -1,6 +1,6 @@
 # Maintainer: OBeard-Wan Cannoli
 pkgname=claude-status
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="System tray app showing live Claude/Anthropic service status as a scrolling history bar"
 arch=('any')
@@ -8,7 +8,7 @@ url="https://github.com/OBeardWan/claude-status"
 license=('MIT')
 depends=('python' 'python-gobject' 'gtk3' 'libayatana-appindicator' 'python-cairo' 'libnotify')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('bdaba7951f53b3f72a6346124d91b6c27e9faf7ba1954097aed3aa86a17c3d8b')
+sha256sums=('SKIP')
 
 package() {
   cd "$pkgname-$pkgver"
